@@ -2,7 +2,7 @@
 
 FastAPI service that turns an uploaded EPUB into a readable document plus synthesized speech.
 
-See [../spec/plan.md](../spec/plan.md) for decisions and ADRs, [../CLAUDE.md](../CLAUDE.md) for conventions, [../README.md](../README.md) for the Flutter client.
+See [../README.md](../README.md) for the Flutter client.
 
 ## Setup
 
@@ -38,7 +38,7 @@ POST /upload  →  EbooklibParser  →  Book(Chapter[], Chunk[])  →  InMemoryS
 GET /tts/chunk/{id}  →  audio, synthesized on demand and cached
 ```
 
-All HTTP. A WebSocket control plane used to warm the cache ahead of the playhead; it was removed once the player's own read-ahead proved to cover it, and it had caused most of this project's hard bugs ([ADR-1](../spec/plan.md#architecture-decision-records)). No per-client connection state, and seeking anywhere is free.
+All HTTP, and stateless between requests — nothing is held open per client. Chunks are synthesized on first request and cached, so seeking anywhere is free: a cold chunk simply synthesizes on demand.
 
 ### Parsing
 
@@ -61,7 +61,7 @@ Prose is detected by **shape, not a dictionary** (`parsers/text_quality.py`): mo
 
 ### Chunking
 
-Sentence-level, per block, so a paragraph break is a hard boundary and the highlight stays in the paragraph being read. The first chunk of the first paragraph is a single sentence for fast first audio ([ADR-3](../spec/plan.md#architecture-decision-records)); later chunks group three.
+Sentence-level, per block, so a paragraph break is a hard boundary and the highlight stays in the paragraph being read. The first chunk of the first paragraph is a single sentence, so the first audio arrives fast; later chunks group three to cut per-request overhead.
 
 ## TTS providers
 
@@ -86,7 +86,7 @@ Caching( Encoding( provider ) )
    └─────────── sha256(provider:voice:text) → filesystem cache
 ```
 
-Caching sits **outside** encoding, so a hit costs neither an API call nor a transcode. Speed is not in the key — it's applied client-side, so changing it never re-synthesizes ([ADR-3](../spec/plan.md#architecture-decision-records)).
+Caching sits **outside** encoding, so a hit costs neither an API call nor a transcode. Speed is deliberately not in the key: it's applied client-side, so changing it never re-synthesizes.
 
 There was a retry decorator. Removed: Piper is the default and its failures are deterministic, so retrying never helped the common case, and a failed chunk isn't fatal — the reader taps again.
 
@@ -137,7 +137,7 @@ POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44
 
 ### Gaps
 
-- **No streaming** — latency is the full synthesis time. Their streaming endpoint (and its character timings, [ADR-2](../spec/plan.md#architecture-decision-records)) is unused.
+- **No streaming** — latency is the full synthesis time. Their streaming endpoint, and the character-level timings it carries, are unused.
 - **MP3, then transcoded.** They can return `opus_48000_*` directly, skipping ffmpeg (~67ms CPU/chunk). Not taken: the docs don't say whether that Opus is Ogg-contained, and serving raw Opus as `audio/ogg` is the exact bug that made Safari refuse chunks once. Verify against a real key first.
 
 ## Configuration
