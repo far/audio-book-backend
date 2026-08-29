@@ -1,0 +1,8 @@
+.venv/
+voices/
+__pycache__/
+*.pyc
+voices/*.onnx
+voices/*.onnx.json
+tmp/
+.pytest_cache/

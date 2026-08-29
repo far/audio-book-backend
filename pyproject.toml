@@ -1,0 +1,49 @@
+[project]
+name = "aireader-backend"
+version = "0.1.0"
+description = "FastAPI TTS service for AI Reader"
+requires-python = ">=3.13"
+# numpy and onnxruntime are intentionally absent: both arrive transitively
+# (onnxruntime via piper-tts, numpy via onnxruntime) and nothing here
+# imports them directly. soundfile was listed and never imported at all --
+# it pulls cffi and the libsndfile binary for nothing.
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "ebooklib>=0.20",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "piper-tts>=1.6.1",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.52.3",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.3",
+]
+
+[tool.ruff.lint]
+# B008: FastAPI's Depends()-as-default is the framework's own idiom, not a
+# real mutable-default bug -- a known false positive for FastAPI apps.
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[[tool.mypy.overrides]]
+# Neither ships a py.typed marker / stubs.
+module = ["ebooklib", "ebooklib.epub", "piper"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
