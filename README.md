@@ -1,8 +1,114 @@
 # AI Reader backend
 
-FastAPI service that turns an uploaded EPUB into a readable document plus synthesized speech.
+FastAPI application which converts uploaded `EPUB` book into a readable document plus synthesized speech using Text-To-Speach(TTS) providers.
 
-See [../README.md](../README.md) for the Flutter client.
+## TTS providers
+
+### Registered providers
+
+| Provider | `name` | Native output | Requires |
+| --- | --- | --- | --- |
+| Piper | `piper` | WAV | nothing — offline |
+| ElevenLabs | `elevenlabs` | MP3 | `ELEVENLABS_API_KEY` |
+| OpenAI TTS | `openai` | MP3 | `OPENAI_API_KEY` |
+
+A provider is registered **only when its key is set**, so `/tts/providers` never offers one that would fail, and the client's picker is built from that response.
+
+## ElevenLabs
+
+Adapter: `app/infrastructure/tts/elevenlabs_provider.py`, ~70 lines — the decorators handle everything cross-cutting.
+
+### Enable
+
+```bash
+export ELEVENLABS_API_KEY=sk_...
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+curl localhost:8000/tts/providers   # confirm it registered
+```
+
+The app builds one `Settings` at import, so **restart after changing the environment**. A key present costs nothing by itself: selection is per request and defaults to Piper.
+
+### Request
+
+```
+POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44100_128
+  xi-api-key: <key>
+  {"text": "...", "model_id": "eleven_multilingual_v2"}
+→ MP3, 30s timeout
+```
+
+`model_id` and `output_format` are pinned rather than left to API defaults, which are theirs to change. Non-200 raises `ProviderError` with the status and first 200 bytes of the body.
+
+## Register new TTS provider
+
+One narrow port:
+
+```python
+class TTSProvider(ABC):
+    name: str
+    async def synthesize(self, text: str, settings: TTSSettings) -> SynthesisResult: ...
+    async def list_voices(self) -> list[Voice]: ...
+```
+
+Adding a provider is **one adapter file + one line in `deps.py`**.
+
+### Decorators
+
+Applied identically to every provider in `_build_provider`, so cross-cutting work is written once:
+
+```
+Caching( Encoding( provider ) )
+   │        └─ ffmpeg → Ogg Opus, so the client handles one codec
+   └─────────── sha256(provider:voice:text) → filesystem cache
+```
+
+Caching sits **outside** encoding, so a hit costs neither an API call nor a transcode. Speed is deliberately not in the key: it's applied client-side, so changing it never re-synthesizes.
+
+There was a retry decorator. Removed: Piper is the default and its failures are deterministic, so retrying never helped the common case, and a failed chunk isn't fatal — the reader taps again.
+
+
+### Voices
+
+`list_voices()` calls `GET /v1/voices` and returns voices with their **names** — the picker can't offer `21m00Tcm4TlvDq8ikWAM` as a choice. Fetched once per process; only successes are cached, so a corrected key takes effect without a restart. Any failure falls back to one stock voice, because `/tts/providers` lists every provider and one bad key must not break it for the rest.
+
+### Cost
+
+- **`MAX_CHARACTERS_PER_SESSION`** (500k) bounds spend per upload. Over-budget books are **truncated, not rejected** — the overflow stays readable but unvoiced.
+- **The cache is the main saving.** Keyed on content, shared across sessions, survives restarts (`tmp/audio_cache`, 500MB LRU). Re-reading a chapter or changing speed costs nothing.
+- **The player reads ahead**, so audio is paid for slightly before it's heard. Skipping around can pay for chunks never played.
+
+### Gaps
+
+- **No streaming** — latency is the full synthesis time. Their streaming endpoint, and the character-level timings it carries, are unused.
+- **MP3, then transcoded.** They can return `opus_48000_*` directly, skipping ffmpeg (~67ms CPU/chunk). Not taken: the docs don't say whether that Opus is Ogg-contained, and serving raw Opus as `audio/ogg` is the exact bug that made Safari refuse chunks once. Verify against a real key first.
+
+## Configuration
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ELEVENLABS_API_KEY` | unset | Registers ElevenLabs when set |
+| `OPENAI_API_KEY` | unset | Registers OpenAI when set |
+| `DEFAULT_TTS_PROVIDER` | `piper` | Used when a request omits `provider` |
+| `DEFAULT_TTS_VOICE_ID` | `en_US-lessac-medium` | Used when a request omits `voice_id` |
+| `MAX_UPLOAD_BYTES` | 12MB | Bounds RAM as much as bandwidth — parsing peaks at ~18× the compressed file |
+| `MAX_EPUB_UNCOMPRESSED_BYTES` | 200MB | Zip-bomb guard, checked before parsing |
+| `MAX_CHARACTERS_PER_SESSION` | 500,000 | Synthesis budget; over-budget books are truncated |
+| `SESSION_TTL_SECONDS` | 7200 | How long an *untouched* session is kept. Fetching a chunk counts, so an active listener never expires |
+| `SYNTHESIS_WORKER_POOL_SIZE` | 1 | Threads shared by Piper and ffmpeg. Sized for one vCPU |
+
+No auth, no TLS. Don't expose beyond a LAN or a disposable host.
+
+
+## API
+
+Self-documenting at `/docs`, or `/openapi.json`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /upload` | EPUB → parsed `Book`. Non-EPUBs get 422 |
+| `GET /session/{book_id}` | Re-fetch a parsed book |
+| `GET /tts/chunk/{chunk_id}` | Audio for one chunk. `?provider=&voice_id=` optional. Returns `audio/ogg; codecs=opus` |
+| `GET /tts/providers` | Registered providers and their voices |
 
 ## Setup
 
@@ -62,110 +168,6 @@ Prose is detected by **shape, not a dictionary** (`parsers/text_quality.py`): mo
 ### Chunking
 
 Sentence-level, per block, so a paragraph break is a hard boundary and the highlight stays in the paragraph being read. The first chunk of the first paragraph is a single sentence, so the first audio arrives fast; later chunks group three to cut per-request overhead.
-
-## TTS providers
-
-One narrow port:
-
-```python
-class TTSProvider(ABC):
-    name: str
-    async def synthesize(self, text: str, settings: TTSSettings) -> SynthesisResult: ...
-    async def list_voices(self) -> list[Voice]: ...
-```
-
-Adding a provider is **one adapter file + one line in `deps.py`**.
-
-### Decorators
-
-Applied identically to every provider in `_build_provider`, so cross-cutting work is written once:
-
-```
-Caching( Encoding( provider ) )
-   │        └─ ffmpeg → Ogg Opus, so the client handles one codec
-   └─────────── sha256(provider:voice:text) → filesystem cache
-```
-
-Caching sits **outside** encoding, so a hit costs neither an API call nor a transcode. Speed is deliberately not in the key: it's applied client-side, so changing it never re-synthesizes.
-
-There was a retry decorator. Removed: Piper is the default and its failures are deterministic, so retrying never helped the common case, and a failed chunk isn't fatal — the reader taps again.
-
-### Registered providers
-
-| Provider | `name` | Native output | Requires |
-| --- | --- | --- | --- |
-| Piper | `piper` | WAV | nothing — offline |
-| ElevenLabs | `elevenlabs` | MP3 | `ELEVENLABS_API_KEY` |
-| OpenAI TTS | `openai` | MP3 | `OPENAI_API_KEY` |
-
-A provider is registered **only when its key is set**, so `/tts/providers` never offers one that would fail, and the client's picker is built from that response.
-
-## ElevenLabs
-
-Adapter: `app/infrastructure/tts/elevenlabs_provider.py`, ~70 lines — the decorators handle everything cross-cutting.
-
-### Enable
-
-```bash
-export ELEVENLABS_API_KEY=sk_...
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
-curl localhost:8000/tts/providers   # confirm it registered
-```
-
-The app builds one `Settings` at import, so **restart after changing the environment**. A key present costs nothing by itself: selection is per request and defaults to Piper.
-
-### Request
-
-```
-POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44100_128
-  xi-api-key: <key>
-  {"text": "...", "model_id": "eleven_multilingual_v2"}
-→ MP3, 30s timeout
-```
-
-`model_id` and `output_format` are pinned rather than left to API defaults, which are theirs to change. Non-200 raises `ProviderError` with the status and first 200 bytes of the body.
-
-### Voices
-
-`list_voices()` calls `GET /v1/voices` and returns voices with their **names** — the picker can't offer `21m00Tcm4TlvDq8ikWAM` as a choice. Fetched once per process; only successes are cached, so a corrected key takes effect without a restart. Any failure falls back to one stock voice, because `/tts/providers` lists every provider and one bad key must not break it for the rest.
-
-### Cost
-
-- **`MAX_CHARACTERS_PER_SESSION`** (500k) bounds spend per upload. Over-budget books are **truncated, not rejected** — the overflow stays readable but unvoiced.
-- **The cache is the main saving.** Keyed on content, shared across sessions, survives restarts (`tmp/audio_cache`, 500MB LRU). Re-reading a chapter or changing speed costs nothing.
-- **The player reads ahead**, so audio is paid for slightly before it's heard. Skipping around can pay for chunks never played.
-
-### Gaps
-
-- **No streaming** — latency is the full synthesis time. Their streaming endpoint, and the character-level timings it carries, are unused.
-- **MP3, then transcoded.** They can return `opus_48000_*` directly, skipping ffmpeg (~67ms CPU/chunk). Not taken: the docs don't say whether that Opus is Ogg-contained, and serving raw Opus as `audio/ogg` is the exact bug that made Safari refuse chunks once. Verify against a real key first.
-
-## Configuration
-
-| Env var | Default | Purpose |
-| --- | --- | --- |
-| `ELEVENLABS_API_KEY` | unset | Registers ElevenLabs when set |
-| `OPENAI_API_KEY` | unset | Registers OpenAI when set |
-| `DEFAULT_TTS_PROVIDER` | `piper` | Used when a request omits `provider` |
-| `DEFAULT_TTS_VOICE_ID` | `en_US-lessac-medium` | Used when a request omits `voice_id` |
-| `MAX_UPLOAD_BYTES` | 12MB | Bounds RAM as much as bandwidth — parsing peaks at ~18× the compressed file |
-| `MAX_EPUB_UNCOMPRESSED_BYTES` | 200MB | Zip-bomb guard, checked before parsing |
-| `MAX_CHARACTERS_PER_SESSION` | 500,000 | Synthesis budget; over-budget books are truncated |
-| `SESSION_TTL_SECONDS` | 7200 | How long an *untouched* session is kept. Fetching a chunk counts, so an active listener never expires |
-| `SYNTHESIS_WORKER_POOL_SIZE` | 1 | Threads shared by Piper and ffmpeg. Sized for one vCPU |
-
-No auth, no TLS. Don't expose beyond a LAN or a disposable host.
-
-## API
-
-Self-documenting at `/docs`, or `/openapi.json`.
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /upload` | EPUB → parsed `Book`. Non-EPUBs get 422 |
-| `GET /session/{book_id}` | Re-fetch a parsed book |
-| `GET /tts/chunk/{chunk_id}` | Audio for one chunk. `?provider=&voice_id=` optional. Returns `audio/ogg; codecs=opus` |
-| `GET /tts/providers` | Registered providers and their voices |
 
 ## Testing
 
