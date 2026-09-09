@@ -1,6 +1,8 @@
-# AI Reader backend
+# `Audio Book` backend
 
 FastAPI application which converts uploaded `EPUB` book into a readable document plus synthesized speech using Text-To-Speach(TTS) providers.
+
+Flutter client is [here](https://github.com/far/audio-book-frontend)
 
 ## TTS providers
 
