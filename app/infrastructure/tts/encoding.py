@@ -20,16 +20,27 @@ from app.domain.errors import ProviderError
 # Safari and iOS refuse to decode the response outright.
 OGG_OPUS_MIME_TYPE = "audio/ogg; codecs=opus"
 
+# ffmpeg demuxer per provider output type. The input format is passed
+# explicitly (no probing), so it must match what the provider actually
+# returned -- forcing `-f wav` on ElevenLabs/OpenAI MP3 made every paid
+# chunk fail with "invalid start code ... in RIFF header" -> 502.
+_INPUT_FORMATS = {
+    "audio/wav": "wav",
+    "audio/mpeg": "mp3",
+}
 
-def _transcode_to_opus_sync(audio_bytes: bytes) -> bytes:
+
+def _transcode_to_opus_sync(audio_bytes: bytes, mime_type: str = "audio/wav") -> bytes:
+    input_format = _INPUT_FORMATS.get(mime_type)
+    if input_format is None:
+        raise RuntimeError(f"unsupported input audio type for transcode: {mime_type}")
     proc = subprocess.run(
         # 24k mono is transparent for speech and measured 26% smaller than
         # 32k (14.6KB -> 10.8KB per chunk) at no CPU cost -- worth it on a
-        # host billed for egress. `-f wav` skips input probing; Piper always
-        # emits mono 22050Hz.
+        # host billed for egress. An explicit input format skips probing.
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "wav", "-i", "pipe:0",
+            "-f", input_format, "-i", "pipe:0",
             "-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-application", "voip",
             "-f", "opus", "pipe:1",
         ],
@@ -52,7 +63,9 @@ class EncodingTTSProvider(TTSProvider):
         result = await self._wrapped.synthesize(text, settings)
         loop = asyncio.get_running_loop()
         try:
-            opus_bytes = await loop.run_in_executor(self._worker_pool, _transcode_to_opus_sync, result.audio_bytes)
+            opus_bytes = await loop.run_in_executor(
+                self._worker_pool, _transcode_to_opus_sync, result.audio_bytes, result.mime_type
+            )
         except RuntimeError as exc:
             raise ProviderError(provider=self._wrapped.name, reason=str(exc)) from exc
         return SynthesisResult(audio_bytes=opus_bytes, mime_type=OGG_OPUS_MIME_TYPE)
